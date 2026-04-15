@@ -2,7 +2,7 @@
 
 I work between an Ubuntu laptop when I'm travelling and a Windows desktop at home, and I keep project files in sync through Dropbox. Claude Code's memory feature is great — it remembers who I am, how I like to work, and what's going on in each project, so I don't re-explain it every session — but the memories live on one machine at a time. Each time I switched laptops, the other Claude had stale context, or none at all. I kept telling it to ignore its own memory because the memory was wrong. I also lost the ability to `/resume` recent sessions on the other machine.
 
-So I wrote this. It's a ~300-line Python script that two-way syncs Claude Code's memory files, session transcripts, and skills between machines via a folder in Dropbox.
+So Claude Code helped me write this. It's a ~300-line Python script that two-way syncs Claude Code's memory files, session transcripts, and skills between machines via a folder in Dropbox.
 
 ## Why not tawanorg/claude-sync?
 
@@ -21,19 +21,41 @@ I already pay for Dropbox, already trust it with my code, and wanted something I
 - Before overwriting a file whose contents differ, copies the older version to `Dropbox/claude-memory-sync/backups/<timestamp>/` — so last-write-wins is at least recoverable.
 - Refuses to sync if two machines try to register different projects under the same basename (e.g. two different `website/` directories), and tells you which one collided.
 
-## Install
+## Setup — do this once per machine
 
-Requires Python 3.8+, Dropbox running on both machines, and the repo cloned somewhere you can run it from.
+Requires Python 3.8+ and the Dropbox desktop client running.
+
+**1. Clone into your Claude skills directory.** The folder name matters — it must be `claude-memory-sync`, because that's the path you'll invoke.
 
 ```bash
 git clone https://github.com/siddharth-bharath/claude-memory-sync ~/.claude/skills/claude-memory-sync
 ```
 
+On Windows (Git Bash / PowerShell with `$USERPROFILE`):
+
+```bash
+git clone https://github.com/siddharth-bharath/claude-memory-sync "$USERPROFILE/.claude/skills/claude-memory-sync"
+```
+
 Cloning into `~/.claude/skills/` also makes it show up as a Claude Code skill, so you can say "sync my memory" in a session and Claude will find it.
 
-If your Dropbox root isn't `~/Dropbox` or a common alternative, export `CLAUDE_SYNC_DROPBOX=/path/to/Dropbox`.
+**2. If your Dropbox root isn't auto-detected**, export `CLAUDE_SYNC_DROPBOX=/path/to/Dropbox`. The script checks `~/Dropbox`, `~/Dropbox (Personal)`, and a few others; Windows users whose Dropbox lives on `D:` usually need to set this.
 
-## Use
+**3. Run a real sync from any project directory** (not just `--list` — `--list` is read-only and does *not* register the machine):
+
+```bash
+python ~/.claude/skills/claude-memory-sync/sync.py
+```
+
+**4. Verify the machine is registered:**
+
+```bash
+python ~/.claude/skills/claude-memory-sync/sync.py --list
+```
+
+Under the current project you should see your hostname listed alongside any other machines already syncing that project. If you only see one hostname after running on both machines, something is wrong — most likely the other machine is running an older fork of this script that points at a different Dropbox subfolder (check for a stray `~/.claude/skills/claude-sync/` and delete it).
+
+## Everyday use
 
 From any project directory:
 
@@ -41,7 +63,7 @@ From any project directory:
 python ~/.claude/skills/claude-memory-sync/sync.py
 ```
 
-Syncs that project's memory and sessions, plus global skills. Run it at the start and end of a work session, or whenever you switch machines.
+Syncs that project's memory and sessions, plus global skills. Run it at the start and end of a work session, or whenever you switch machines. If you installed the skill, you can also just say "sync my memory" in a Claude Code session.
 
 Useful flags:
 
@@ -49,7 +71,7 @@ Useful flags:
 - `--dry-run` — show what would change, copy nothing.
 - `--skills-only` / `--no-skills` — sync just skills, or skip them.
 - `--project /abs/path` — sync a project other than the current directory.
-- `--list` — print the registry.
+- `--list` — print the registry. Does *not* sync or register anything.
 
 ## Honest caveats
 
