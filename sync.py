@@ -178,6 +178,35 @@ def sync_jsonl(local_root: Path, remote_sessions: Path, backups_root: Path,
                 shutil.copy2(pr, pl)
 
 
+def is_excluded(dropbox_root: Path, canonical: str) -> bool:
+    """Return True if this canonical name is in the registry's excluded list."""
+    reg_path = dropbox_root / SYNC_SUBPATH / REGISTRY_NAME
+    if not reg_path.exists():
+        return False
+    try:
+        data = json.loads(reg_path.read_text())
+    except Exception:
+        return False
+    return canonical in data.get("excluded", [])
+
+
+def set_excluded(dropbox_root: Path, canonical: str, exclude: bool):
+    """Add or remove canonical from the registry's excluded list."""
+    reg_path = dropbox_root / SYNC_SUBPATH / REGISTRY_NAME
+    data = json.loads(reg_path.read_text()) if reg_path.exists() else {}
+    excluded = data.setdefault("excluded", [])
+    if exclude and canonical not in excluded:
+        excluded.append(canonical)
+        # Also remove from projects so --all doesn't visit it
+        data.get("projects", {}).pop(canonical, None)
+    elif not exclude and canonical in excluded:
+        excluded.remove(canonical)
+    reg_path.parent.mkdir(parents=True, exist_ok=True)
+    reg_path.write_text(json.dumps(data, indent=2))
+    action = "excluded" if exclude else "un-excluded"
+    print(f"{canonical} {action}.")
+
+
 def sync_project(abs_path: Path, dropbox_root: Path, backups_root: Path,
                  dry_run: bool, log: list):
     local_dir = resolve_project_dir(abs_path)
@@ -187,6 +216,10 @@ def sync_project(abs_path: Path, dropbox_root: Path, backups_root: Path,
     log.append(f"\n=== project: {canonical} ===")
     log.append(f"  local : {local_dir}")
     log.append(f"  remote: {remote_dir}")
+
+    if is_excluded(dropbox_root, canonical):
+        log.append("  SKIPPED (excluded — run with --unexclude to re-enable)")
+        return
 
     if not check_collision(dropbox_root, canonical, abs_path, log):
         log.append("  SKIPPED due to collision")
@@ -288,6 +321,10 @@ def main():
     ap.add_argument("--list", action="store_true", help="Show registry then exit")
     ap.add_argument("--no-skills", action="store_true", help="Skip ~/.claude/skills/")
     ap.add_argument("--skills-only", action="store_true", help="Only sync skills")
+    ap.add_argument("--exclude", metavar="NAME",
+                    help="Add canonical project name to excluded list and stop syncing it")
+    ap.add_argument("--unexclude", metavar="NAME",
+                    help="Remove canonical project name from excluded list")
     args = ap.parse_args()
 
     dropbox_root = find_dropbox_root()
@@ -303,6 +340,14 @@ def main():
             print(reg.read_text())
         else:
             print("(no registry yet)")
+        return
+
+    if args.exclude:
+        set_excluded(dropbox_root, args.exclude, True)
+        return
+
+    if args.unexclude:
+        set_excluded(dropbox_root, args.unexclude, False)
         return
 
     targets: list[Path] = []
