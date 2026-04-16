@@ -232,7 +232,14 @@ def check_collision(dropbox_root: Path, canonical: str, abs_path: Path, log: lis
         return True
     my_name = abs_path.name.lower()
     for other_host, other_path in other_paths.items():
-        other_name = Path(other_path).name.lower()
+        # Use PureWindowsPath for Windows-style paths (drive letter + backslash)
+        # so that basename extraction works correctly when running on Linux.
+        import re as _re
+        if _re.match(r'^[A-Za-z]:[/\\]', other_path):
+            from pathlib import PureWindowsPath
+            other_name = PureWindowsPath(other_path).name.lower()
+        else:
+            other_name = Path(other_path).name.lower()
         if other_name != my_name:
             log.append(
                 f"  COLLISION: canonical='{canonical}' but machine '{other_host}' "
