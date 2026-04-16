@@ -72,6 +72,8 @@ Useful flags:
 - `--skills-only` / `--no-skills` — sync just skills, or skip them.
 - `--project /abs/path` — sync a project other than the current directory.
 - `--list` — print the registry. Does *not* sync or register anything.
+- `--exclude NAME` — add a project's canonical name (folder basename) to the excluded list. It is removed from the registry and will be silently skipped by all future syncs, including `--all`. Useful for home-directory or other catch-all project roots you never want synced.
+- `--unexclude NAME` — remove a name from the excluded list so it can be synced again.
 
 ## Honest caveats
 
