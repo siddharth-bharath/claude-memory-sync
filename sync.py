@@ -15,6 +15,11 @@ Newest-mtime-wins per file. Never deletes. Before overwriting a differing file,
 the older version is copied to Dropbox/claude-memory-sync/backups/<timestamp>/
 so last-write-wins is recoverable.
 
+Session transcripts (*.jsonl) are stored gzipped on Dropbox (*.jsonl.gz) and
+decompressed back to *.jsonl on pull. Local Claude Code session files are
+always raw .jsonl so /resume keeps working. Legacy raw .jsonl files left on
+Dropbox by older versions are migrated to .jsonl.gz on next sync.
+
 Usage:
   python sync.py                   # sync project in cwd + skills
   python sync.py --project /abs    # sync a different project
@@ -25,7 +30,7 @@ Usage:
   python sync.py --list            # print registry
 """
 from __future__ import annotations
-import argparse, json, os, shutil, socket, sys, filecmp
+import argparse, gzip, json, os, shutil, socket, sys, filecmp
 from pathlib import Path
 from datetime import datetime
 
@@ -145,37 +150,95 @@ def sync_pair(local: Path, remote: Path, label: str, backups_root: Path,
                 shutil.copy2(pr, pl)
 
 
+def gz_compress(src: Path, dst: Path):
+    """Gzip src -> dst atomically; preserve src's mtime on dst."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp")
+    src_mtime = src.stat().st_mtime
+    with src.open("rb") as f_in, gzip.GzipFile(
+            filename=tmp, mode="wb", compresslevel=6, mtime=src_mtime) as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    os.utime(tmp, (src_mtime, src_mtime))
+    tmp.replace(dst)
+
+
+def gz_decompress(src: Path, dst: Path):
+    """Gunzip src -> dst atomically; preserve src's mtime on dst."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp")
+    src_mtime = src.stat().st_mtime
+    with gzip.open(src, "rb") as f_in, tmp.open("wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    os.utime(tmp, (src_mtime, src_mtime))
+    tmp.replace(dst)
+
+
 def sync_jsonl(local_root: Path, remote_sessions: Path, backups_root: Path,
                dry_run: bool, log: list):
-    """Sync *.jsonl at the project root only (not recursive)."""
+    """Sync *.jsonl at the project root only (not recursive).
+
+    Local stores raw .jsonl (Claude Code reads these directly for /resume).
+    Remote stores .jsonl.gz to save Dropbox space (sessions compress ~5–10x).
+    Legacy raw .jsonl files on remote are migrated to .jsonl.gz on first run.
+    """
     remote_sessions.mkdir(parents=True, exist_ok=True)
     local_root.mkdir(parents=True, exist_ok=True)
+
+    # Migrate legacy raw .jsonl on remote -> .jsonl.gz, preserving mtime.
+    for legacy in list(remote_sessions.glob("*.jsonl")):
+        gz_path = remote_sessions / (legacy.name + ".gz")
+        if gz_path.exists():
+            # Both exist: keep the newer-mtime one, drop the loser.
+            if gz_path.stat().st_mtime + 1 >= legacy.stat().st_mtime:
+                log.append(f"  [sessions] migrate: drop redundant raw {legacy.name}")
+                if not dry_run:
+                    legacy.unlink()
+            else:
+                log.append(f"  [sessions] migrate: re-gzip {legacy.name} (newer)")
+                if not dry_run:
+                    gz_compress(legacy, gz_path)
+                    legacy.unlink()
+        else:
+            log.append(f"  [sessions] migrate: gzip {legacy.name}")
+            if not dry_run:
+                gz_compress(legacy, gz_path)
+                legacy.unlink()
+
     names = set()
     for p in local_root.glob("*.jsonl"):
         names.add(p.name)
-    for p in remote_sessions.glob("*.jsonl"):
-        names.add(p.name)
+    for p in remote_sessions.glob("*.jsonl.gz"):
+        names.add(p.name[:-3])  # strip .gz, keep .jsonl
+
     for name in sorted(names):
         pl = local_root / name
-        pr = remote_sessions / name
-        if pl.exists() and pr.exists():
-            mtl, mtr = pl.stat().st_mtime, pr.stat().st_mtime
+        pr_gz = remote_sessions / (name + ".gz")
+        if pl.exists() and pr_gz.exists():
+            mtl, mtr = pl.stat().st_mtime, pr_gz.stat().st_mtime
             if mtl > mtr + 1:
                 log.append(f"  [sessions] push {name}")
-                copy_with_backup(pl, pr, backups_root,
-                                 Path("sessions") / "remote" / name, dry_run, log)
+                if not dry_run:
+                    bpath = backups_root / "sessions" / "remote" / (name + ".gz")
+                    bpath.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(pr_gz, bpath)
+                    log.append(f"    backup: sessions/remote/{name}.gz")
+                    gz_compress(pl, pr_gz)
             elif mtr > mtl + 1:
                 log.append(f"  [sessions] pull {name}")
-                copy_with_backup(pr, pl, backups_root,
-                                 Path("sessions") / "local" / name, dry_run, log)
+                if not dry_run:
+                    bpath = backups_root / "sessions" / "local" / name
+                    bpath.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(pl, bpath)
+                    log.append(f"    backup: sessions/local/{name}")
+                    gz_decompress(pr_gz, pl)
         elif pl.exists():
             log.append(f"  [sessions] push {name} (new)")
             if not dry_run:
-                shutil.copy2(pl, pr)
+                gz_compress(pl, pr_gz)
         else:
             log.append(f"  [sessions] pull {name} (new)")
             if not dry_run:
-                shutil.copy2(pr, pl)
+                gz_decompress(pr_gz, pl)
 
 
 def is_excluded(dropbox_root: Path, canonical: str) -> bool:
