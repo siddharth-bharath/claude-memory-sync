@@ -20,17 +20,28 @@ decompressed back to *.jsonl on pull. Local Claude Code session files are
 always raw .jsonl so /resume keeps working. Legacy raw .jsonl files left on
 Dropbox by older versions are migrated to .jsonl.gz on next sync.
 
+Dropbox is treated as a transport buffer, not an archive: sessions older
+than SESSION_RETENTION_DAYS and old backup snapshots are pruned at the end
+of every sync. The local copies on each machine are the canonical archive
+and are never touched.
+
 Usage:
   python sync.py                   # sync project in cwd + skills
   python sync.py --project /abs    # sync a different project
   python sync.py --all             # sync every registered project on this machine
   python sync.py --skills-only     # skip project work
   python sync.py --no-skills       # skip skills
+  python sync.py --no-prune        # skip the prune-old-stuff pass at end
   python sync.py --dry-run
   python sync.py --list            # print registry
+  python sync.py --export-bundle PATH
+                                   # write a tar.gz of all local memory + sessions
+                                   # + skills, organized by canonical name, for
+                                   # bootstrapping a fresh machine with full history
+                                   # (Dropbox only carries the rolling window).
 """
 from __future__ import annotations
-import argparse, gzip, json, os, shutil, socket, sys, filecmp
+import argparse, gzip, json, os, shutil, socket, sys, tarfile, tempfile, time, filecmp
 from pathlib import Path
 from datetime import datetime
 
@@ -40,6 +51,12 @@ SKILLS_SUBDIR = "skills"
 BACKUPS_SUBDIR = "backups"
 REGISTRY_NAME = "registry.json"
 LOG_DIR_NAME = "logs"
+
+# Rolling-window retention. Dropbox is a transport buffer; the canonical copy
+# of every session and memory file lives on each machine's local disk.
+SESSION_RETENTION_DAYS = 90        # drop .jsonl.gz on Dropbox older than this
+BACKUP_RETENTION_DAYS = 7          # keep all backups newer than this
+BACKUP_RETENTION_MIN_RUNS = 10     # ...and always keep at least this many most-recent runs
 
 
 def find_dropbox_root() -> Path:
@@ -368,6 +385,179 @@ def update_registry(dropbox_root: Path, canonical: str, abs_path: Path, local_di
     reg_path.write_text(json.dumps(data, indent=2))
 
 
+def prune_old_sessions(dropbox_root: Path, dry_run: bool, log: list):
+    """Drop *.jsonl.gz on Dropbox older than SESSION_RETENTION_DAYS.
+
+    Local raw .jsonl files are the canonical archive and are never touched
+    here — older sessions remain resumable on whichever machine recorded them.
+    """
+    projects_root = dropbox_root / SYNC_SUBPATH / PROJECTS_SUBDIR
+    if not projects_root.exists():
+        return
+    cutoff = time.time() - SESSION_RETENTION_DAYS * 86400
+    dropped = 0
+    bytes_freed = 0
+    for gz in projects_root.glob("*/sessions/*.jsonl.gz"):
+        if gz.stat().st_mtime < cutoff:
+            bytes_freed += gz.stat().st_size
+            dropped += 1
+            log.append(f"  [prune] drop {gz.relative_to(projects_root)} "
+                       f"(>{SESSION_RETENTION_DAYS}d old)")
+            if not dry_run:
+                gz.unlink()
+    if dropped:
+        log.append(f"  [prune] sessions: {dropped} files, "
+                   f"{bytes_freed/1e6:.1f} MB freed")
+
+
+def prune_old_backups(dropbox_root: Path, dry_run: bool, log: list):
+    """Trim backups/<timestamp>/ directories.
+
+    Keep every backup whose mtime is within BACKUP_RETENTION_DAYS, and
+    additionally keep at least BACKUP_RETENTION_MIN_RUNS most-recent ones.
+    Anything older than both policies is removed.
+    """
+    backups_dir = dropbox_root / SYNC_SUBPATH / BACKUPS_SUBDIR
+    if not backups_dir.exists():
+        return
+    runs = sorted(
+        (d for d in backups_dir.iterdir() if d.is_dir()),
+        key=lambda d: d.name,
+    )
+    if not runs:
+        return
+    cutoff = time.time() - BACKUP_RETENTION_DAYS * 86400
+    keep_recent = set(runs[-BACKUP_RETENTION_MIN_RUNS:])
+    dropped = 0
+    bytes_freed = 0
+    for d in runs:
+        if d in keep_recent:
+            continue
+        if d.stat().st_mtime >= cutoff:
+            continue
+        size = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+        bytes_freed += size
+        dropped += 1
+        log.append(f"  [prune] drop backup {d.name}")
+        if not dry_run:
+            shutil.rmtree(d)
+    if dropped:
+        log.append(f"  [prune] backups: {dropped} runs, "
+                   f"{bytes_freed/1e6:.1f} MB freed")
+
+
+def export_bundle(out_path: Path, dropbox_root: Path, log: list):
+    """Build a tar.gz of every local Claude project + skills, keyed by canonical
+    name, for bootstrapping a fresh machine with full history.
+
+    Bundle layout:
+      manifest.json           - exported_at, host, projects, unregistered
+      skills/                 - copy of ~/.claude/skills/
+      projects/<canonical>/   - registered projects (have a canonical name)
+        memory/...
+        sessions/*.jsonl      - raw transcripts (outer tar.gz handles compression)
+      unregistered/<key>/     - projects with content but no registry entry on
+        memory/...              this host; receiving machine decides what to do
+        sessions/*.jsonl        with them
+
+    To restore on a new machine: extract the bundle, set up each project locally,
+    run `python sync.py` once to register the local key, then copy
+    bundle/projects/<canonical>/{memory,sessions} into the corresponding
+    ~/.claude/projects/<key>/ directory.
+    """
+    claude_projects = Path.home() / ".claude" / "projects"
+    claude_skills = Path.home() / ".claude" / "skills"
+
+    reg_path = dropbox_root / SYNC_SUBPATH / REGISTRY_NAME
+    registry = {}
+    if reg_path.exists():
+        try:
+            registry = json.loads(reg_path.read_text())
+        except Exception:
+            registry = {}
+    host = socket.gethostname()
+
+    # Map this host's local project_key -> canonical name via the registry.
+    key_to_canonical = {}
+    for canonical, entry in registry.get("projects", {}).items():
+        m = entry.get("machines", {}).get(host)
+        if m and m.get("project_key"):
+            key_to_canonical[m["project_key"]] = canonical
+
+    manifest = {
+        "exported_at": datetime.now().astimezone().isoformat(),
+        "host": host,
+        "schema_version": 1,
+        "projects": {},
+        "unregistered": {},
+    }
+
+    out_path = out_path.expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    log.append(f"\n=== export-bundle ===")
+    log.append(f"  out: {out_path}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        staging = Path(tmp) / "bundle"
+        staging.mkdir()
+
+        # Skills.
+        if claude_skills.exists():
+            shutil.copytree(claude_skills, staging / "skills")
+            log.append(f"  + skills/ ({claude_skills})")
+
+        # Projects. Include every directory that has content; registered ones
+        # land under projects/<canonical>, unregistered under unregistered/<local_key>
+        # so the receiving machine can decide what to do with them.
+        if claude_projects.exists():
+            for proj_dir in sorted(claude_projects.iterdir()):
+                if not proj_dir.is_dir():
+                    continue
+                memory_src = proj_dir / "memory"
+                sessions = list(proj_dir.glob("*.jsonl"))
+                if not memory_src.exists() and not sessions:
+                    continue
+                canonical = key_to_canonical.get(proj_dir.name)
+                if canonical:
+                    dst = staging / "projects" / canonical
+                    bucket, label = "projects", canonical
+                else:
+                    dst = staging / "unregistered" / proj_dir.name
+                    bucket, label = "unregistered", proj_dir.name
+                dst.mkdir(parents=True, exist_ok=True)
+                if memory_src.exists():
+                    shutil.copytree(memory_src, dst / "memory")
+                if sessions:
+                    (dst / "sessions").mkdir(exist_ok=True)
+                    for s in sessions:
+                        shutil.copy2(s, dst / "sessions" / s.name)
+                entry = {
+                    "local_key": proj_dir.name,
+                    "session_count": len(sessions),
+                    "has_memory": memory_src.exists(),
+                }
+                if canonical:
+                    entry["abs_path"] = (registry.get("projects", {})
+                        .get(canonical, {}).get("machines", {})
+                        .get(host, {}).get("abs_path"))
+                    manifest["projects"][canonical] = entry
+                else:
+                    manifest["unregistered"][proj_dir.name] = entry
+                log.append(f"  + {bucket}/{label} "
+                           f"({len(sessions)} sessions, memory={memory_src.exists()})")
+
+        (staging / "manifest.json").write_text(
+            json.dumps(manifest, indent=2))
+
+        with tarfile.open(out_path, "w:gz", compresslevel=6) as tar:
+            tar.add(staging, arcname="bundle")
+
+    size_mb = out_path.stat().st_size / 1e6
+    log.append(f"  wrote {size_mb:.1f} MB; "
+               f"{len(manifest['projects'])} registered, "
+               f"{len(manifest['unregistered'])} unregistered projects")
+
+
 def write_log(dropbox_root: Path, log: list):
     log_dir = dropbox_root / SYNC_SUBPATH / LOG_DIR_NAME
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -388,6 +578,11 @@ def main():
                     help="Add canonical project name to excluded list and stop syncing it")
     ap.add_argument("--unexclude", metavar="NAME",
                     help="Remove canonical project name from excluded list")
+    ap.add_argument("--no-prune", action="store_true",
+                    help="Skip the end-of-sync prune of old sessions and old backups")
+    ap.add_argument("--export-bundle", metavar="PATH",
+                    help="Write a tar.gz of all local memory + sessions + skills "
+                         "to PATH for bootstrapping a fresh machine, then exit")
     args = ap.parse_args()
 
     dropbox_root = find_dropbox_root()
@@ -411,6 +606,11 @@ def main():
 
     if args.unexclude:
         set_excluded(dropbox_root, args.unexclude, False)
+        return
+
+    if args.export_bundle:
+        export_bundle(Path(args.export_bundle), dropbox_root, log)
+        print("\n".join(log))
         return
 
     targets: list[Path] = []
@@ -438,6 +638,11 @@ def main():
 
     if not args.no_skills:
         sync_skills(dropbox_root, backups_root, args.dry_run, log)
+
+    if not args.no_prune:
+        log.append(f"\n=== prune ===")
+        prune_old_sessions(dropbox_root, args.dry_run, log)
+        prune_old_backups(dropbox_root, args.dry_run, log)
 
     if not args.dry_run:
         write_log(dropbox_root, log)

@@ -17,9 +17,11 @@ I already pay for Dropbox, already trust it with my code, and wanted something I
 - Two-way syncs `~/.claude/projects/<project>/memory/` (your memory files) and the project's `*.jsonl` session transcripts so `/resume` works across machines.
 - Also syncs `~/.claude/skills/` globally, so a skill you install on one laptop shows up on the other.
 - Uses the project folder's basename as identity, recording each machine's absolute path in `Dropbox/claude-memory-sync/registry.json`.
-- Newest-mtime-wins per file. Never deletes.
+- Newest-mtime-wins per file. Never touches local files except to overwrite with newer versions from Dropbox.
 - Before overwriting a file whose contents differ, copies the older version to `Dropbox/claude-memory-sync/backups/<timestamp>/` — so last-write-wins is at least recoverable.
 - Refuses to sync if two machines try to register different projects under the same basename (e.g. two different `website/` directories), and tells you which one collided.
+- Stores session transcripts gzipped on Dropbox (`*.jsonl.gz`); local copies stay raw `.jsonl` so `/resume` keeps working.
+- Treats Dropbox as a transport buffer, not an archive: prunes session files older than 90 days and old backup snapshots (keeps last 10 runs or anything from the past 7 days, whichever is more) at the end of every sync. Local copies on each machine are the canonical archive and are never pruned.
 
 ## Setup — do this once per machine
 
@@ -74,6 +76,31 @@ Useful flags:
 - `--list` — print the registry. Does *not* sync or register anything.
 - `--exclude NAME` — add a project's canonical name (folder basename) to the excluded list. It is removed from the registry and will be silently skipped by all future syncs, including `--all`. Useful for home-directory or other catch-all project roots you never want synced.
 - `--unexclude NAME` — remove a name from the excluded list so it can be synced again.
+- `--no-prune` — skip the end-of-sync pruning of old sessions and old backups (one-off use; the next normal sync will resume pruning).
+- `--export-bundle PATH` — write a single tar.gz at PATH containing every project's memory + sessions + global skills from this machine, for bootstrapping a brand-new computer with full history (Dropbox only carries the rolling 90-day window). See below.
+
+## Bootstrapping a new machine with full history
+
+Dropbox only carries roughly the last 90 days of session transcripts. If you set up a third machine — or wipe one — and want it to start with the *full* history of memories and sessions you've accumulated, run this on the machine that has it all:
+
+```bash
+python ~/.claude/skills/claude-memory-sync/sync.py --export-bundle ~/claude-bundle.tar.gz
+```
+
+This writes a single tar.gz containing:
+
+- `bundle/manifest.json` — what's inside, with `abs_path` and `local_key` for each project as known by the source machine.
+- `bundle/skills/` — your global skills.
+- `bundle/projects/<canonical>/{memory,sessions}/` — every project that has been synced at least once (i.e. has a canonical-name registry entry).
+- `bundle/unregistered/<local_key>/{memory,sessions}/` — every other project directory in `~/.claude/projects/` on the source machine that has any content. These were never synced, so the canonical mapping isn't known; you decide on the receiving end.
+
+To restore on the new machine: copy the bundle over, extract it, then for each project:
+
+1. `cd` into where the project lives locally on this machine.
+2. Run `python ~/.claude/skills/claude-memory-sync/sync.py` once. This creates `~/.claude/projects/<new-key>/` and registers this machine.
+3. Copy `bundle/projects/<canonical>/{memory,sessions}/` into `~/.claude/projects/<new-key>/` to backfill the older history that isn't on Dropbox.
+
+For the `unregistered/` entries, look at the `local_key` to figure out which project each one came from (the keys are derived from the source machine's absolute path), then do the same dance after deciding whether the project is something you actually use on the new machine.
 
 ## Honest caveats
 
